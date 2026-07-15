@@ -1,65 +1,58 @@
-# Euroleague Team Performance Analytics
+# EuroLeague Team Performance Analytics
 
-A data pipeline and analytics project examining EuroLeague basketball team
-performance — efficiency, home/away splits, and multi-season trends — built on
-game data pulled from the official EuroLeague API.
+An end-to-end analytics project examining EuroLeague basketball team performance
+— efficiency, home/away splits, form trends, and the gap between record and
+underlying strength — built on five seasons of game data pulled from the
+official EuroLeague API.
 
-**Stack:** Python (ETL) → PostgreSQL (star schema) → SQL analysis → Power BI
+**Stack:** Python (ETL) → PostgreSQL (star schema) → SQL analysis (window
+functions, CTEs) → Tableau (interactive dashboard)
+
+![Dashboard](dashboard.png)
 
 ---
 
 ## Overview
 
-This project ingests five seasons of EuroLeague game data, reshapes it into a
-clean star schema, and models it for analysis. It's built to answer questions
-like: *Which teams are over/underperforming relative to their season average?
-How big is home-court advantage, and does it vary by team? What does a team's
-rolling form look like across a season?*
-
-**Status:** the ingestion pipeline and data model are built and loaded. SQL
-analysis and the Power BI dashboard are the next phase (see [Roadmap](#roadmap)).
+Five seasons of EuroLeague game data, ingested from a live API, modeled as a
+star schema, analyzed with SQL, and surfaced through an interactive Tableau
+dashboard. The guiding question: **which teams are genuinely strong versus
+merely lucky, and what drives the difference?**
 
 ## Data
 
-Source: official EuroLeague API, pulled via the [`euroleague-api`](https://pypi.org/project/euroleague-api/) Python package, seasons 2020-21 through 2024-25.
+Source: official EuroLeague API via the
+[`euroleague-api`](https://pypi.org/project/euroleague-api/) Python package,
+seasons 2020-21 through 2024-25.
 
-| Metric | Value |
+| | |
 |---|---|
 | Seasons | 5 (2020-21 → 2024-25) |
-| Unique games | 1,616 |
-| Fact table rows | 3,232 (one row per team per game — each game produces 2 rows) |
-| Teams | 23 distinct clubs |
+| Games | 1,616 |
+| Fact rows | 3,232 (one per team per game — each game = 2 rows) |
 
 ### Schema
 
-Star schema, one fact table + two dimensions:
+Star schema — one fact table, two dimensions:
 
 ```mermaid
 erDiagram
     DIM_TEAM ||--o{ FACT_TEAM_GAME : "team_code"
     DIM_SEASON ||--o{ FACT_TEAM_GAME : "season"
-
     DIM_TEAM {
         string team_code PK
         string team_name
     }
-
     DIM_SEASON {
         int season PK
         string season_label
     }
-
     FACT_TEAM_GAME {
         int season FK
-        int gamecode
         int round
-        string phase
         datetime game_date
-        string team
         string team_code FK
         int pts
-        string opp
-        string opp_code
         int opp_pts
         string venue
         int win
@@ -67,61 +60,69 @@ erDiagram
     }
 ```
 
-`fact_team_game` grain: **one row per team per game.** A single game yields
-exactly two rows (home + away), which is what turns a wide "game report" API
-response into a tidy, joinable fact table — and what makes every team-level
-aggregation (win %, avg margin, home/away splits) a simple `GROUP BY`.
-
-`win` and `margin` are derived once during ETL rather than recomputed in every
-downstream query.
+**Grain: one row per team per game.** Each game produces exactly two rows (home
++ away), which turns a wide "game report" API response into a tidy fact table
+where every team-level metric — win %, avg margin, home/away splits — is a
+simple `GROUP BY`. `win` (1/0) and `margin` are derived once in the ETL so
+downstream queries stay clean.
 
 ## Pipeline
 
-1. **Pull** — `ingest.py` calls the EuroLeague API for each season, pulling
-   seasons concurrently rather than one at a time, then concatenates the raw
-   game reports. This cut wall-clock pull time from ~9 min to ~3 min across
-   the 5 seasons.
-2. **Reshape** — each wide game-report row (home team + away team side by
-   side) is split into two long-format rows, one per team, with `win` and
-   `margin` computed. Unplayed/future games are dropped.
-3. **Build dimensions** — `dim_team` and `dim_season` are derived from the
-   fact rows (distinct team codes/names, distinct seasons with a readable
-   `"2023-24"` label).
-4. **Load** — all three tables are written to CSV and loaded into PostgreSQL.
-5. **Constrain** — `schema.sql` adds primary keys, foreign keys, and indexes
-   on top of the loaded tables to turn them into an enforced star schema.
+`ingest.py` pulls each season from the API, reshapes each wide game report into
+two team rows (computing `win` and `margin`), builds the two dimension tables,
+writes CSVs, and loads PostgreSQL. `schema.sql` then adds primary keys, foreign
+keys, and indexes to enforce the star schema.
 
-Run it:
 ```bash
 pip install euroleague-api pandas sqlalchemy psycopg2-binary
-python ingest.py               # pulls all 5 seasons, writes CSVs, loads Postgres
-python ingest.py --csv-only    # skip the Postgres load, just produce CSVs
-psql -d euroleague -f schema.sql
+python ingest.py                 # pull 5 seasons, write CSVs, load Postgres
+psql -d euroleague -f schema.sql # add keys + indexes
 ```
 
-## Known limitations
+## SQL analysis
 
-- **`dim_team` has a handful of duplicate `team_code` values with different
-  name strings** (e.g. `BAS` appears as both "Baskonia Vitoria-Gasteiz" and a
-  sponsor-prefixed variant from a different season). This is a real data
-  quality issue from clubs changing sponsor names across seasons, and it means
-  `schema.sql`'s `PRIMARY KEY (team_code)` constraint will currently fail
-  until the duplicates are reconciled (e.g. picking the latest name per code).
-  Documenting rather than silently dropping rows, since the fix belongs in the
-  ETL step, not the schema.
+Ten analysis queries in [`sql/`](sql/), progressing from aggregation to window
+functions to CTEs:
 
-## Roadmap
+1. **Win % by team and season** — `AVG(win)` over the 1/0 flag.
+2. **Avg points scored & allowed** — aggregation joined to `dim_team` for names.
+3. **Home vs. away splits** — conditional aggregation with `FILTER (WHERE ...)`.
+4. **Season rankings** — `RANK() OVER (PARTITION BY season ORDER BY win% DESC)`.
+5. **Rolling 5-game form** — `AVG(win) OVER (... ROWS BETWEEN 4 PRECEDING AND CURRENT ROW)`.
+6. **Running wins & losses** — `SUM() OVER (...)` cumulative through the season.
+7. **Margin swings & cumulative point differential** — `LAG(margin) OVER (...)` plus a running `SUM`.
+8. **Season vs. a team's own multi-season baseline** — window `AVG` as a baseline, signed diff.
+9. **Largest home-court edge** — CTE ranking teams by home-minus-away win %.
+10. **Clutch performance** — win % in games decided by ≤5 points (`ABS(margin) <= 5`), filtered aggregation.
 
-- **SQL analysis** — win % by team/season, home vs. away splits, rolling
-  5-game form and cumulative wins via window functions (`RANK`, `AVG() OVER`,
-  `LAG`), and CTE-based questions like largest home/away gap and "clutch"
-  performance in close games.
-- **Power BI dashboard** — DAX measures (win %, avg margin, home/away edge)
-  surfaced through team/season slicers, rolling-form line charts, and a
-  team × season win % matrix.
-- **Insight write-up** — a handful of finding → why-it-matters statements
-  connecting the dashboard back to a business/analyst question.
+## Dashboard
+
+1. **Win % Leaderboard** — team win rate, sortable.
+2. **Home vs. Away** — home and away win % side by side per team.
+3. **Form Over Time** — rolling win % across a season, showing hot/cold streaks.
+4. **Strength vs. Luck** — win % vs. average point differential, with a trend
+   line separating genuinely dominant teams from those living on close games.
+
+## Selected findings
+
+- **Record can overstate a team.** Paris Basketball posted roughly a 53% win rate
+  on a near-zero average point differential — winning a disproportionate share
+  of close games. Their differential suggests a more average team than the
+  record implies, the kind of signal that flags regression risk.
+- **Home-court advantage is near-universal.** Home win % exceeded away win % for
+  nearly every team-season in the data; Olympiacos in 2020 was the lone exception.
+- **Dominance ≠ just winning.** Teams above the trend line (e.g. Olympiacos) won
+  *by more* than their record alone predicts — a sign of real strength, not luck.
+
+## Data quality note
+
+EuroLeague clubs are renamed by their sponsor between seasons (e.g. Baskonia →
+"Bitci Baskonia" → "Cazoo Baskonia"), so the same club appears under several
+`team_name` strings. Grouping on the display name would split one club across
+multiple rows and corrupt every aggregate. **All analysis groups on the stable
+`team_code`** and selects a representative name with `MAX(team)` — catching and
+handling this was one of the more important steps in getting the numbers right.
 
 ---
 
-*Educational/portfolio project — not affiliated with EuroLeague Basketball.*
+*Educational / portfolio project — not affiliated with EuroLeague Basketball.*
